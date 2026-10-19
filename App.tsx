@@ -1,9 +1,11 @@
 import { StatusBar } from 'expo-status-bar';
+import * as WebBrowser from 'expo-web-browser';
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, BackHandler, Button, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
 import { historyScript } from './src/historyScript';
+import { AUTH_CALLBACK_URL, createAuthReturnScript, createGoogleAuthRequest, getGoogleAuthReturnUrl } from './src/googleAuth';
 
 const configuredUrl = process.env.EXPO_PUBLIC_WEB_URL?.trim();
 function readWebUrl() {
@@ -15,12 +17,15 @@ function readWebUrl() {
   }
 }
 const webUrl = readWebUrl();
+const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim() ?? '';
 
 export default function App() {
   const webView = useRef<WebView<object>>(null);
   const nativeCanGoBack = useRef(false);
   const routerIndex = useRef(0);
   const loadingUrl = useRef(webUrl?.href);
+  const authenticating = useRef(false);
+  const [authLoading, setAuthLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [attempt, setAttempt] = useState(0);
@@ -40,6 +45,36 @@ export default function App() {
     });
     return () => subscription.remove();
   }, [error]);
+
+  async function signInWithGoogle(url: string) {
+    if (!webUrl || authenticating.current) return;
+    const request = createGoogleAuthRequest(url, supabaseUrl, webUrl);
+    if (!request) {
+      Alert.alert('로그인 설정 확인', 'Supabase 주소와 PKCE 로그인 요청을 확인해 주세요.');
+      webView.current?.reload();
+      return;
+    }
+    authenticating.current = true;
+    setAuthLoading(true);
+    try {
+      const result = await WebBrowser.openAuthSessionAsync(request.url, AUTH_CALLBACK_URL);
+      if (result.type === 'success') {
+        const targetUrl = getGoogleAuthReturnUrl(result.url, request.returnUrl);
+        routerIndex.current = 0;
+        nativeCanGoBack.current = false;
+        webView.current?.injectJavaScript(createAuthReturnScript(targetUrl, webUrl.origin));
+      } else {
+        // 차단한 location.assign 뒤의 웹 로그인 버튼을 다시 사용할 수 있게 한다.
+        webView.current?.reload();
+      }
+    } catch {
+      webView.current?.reload();
+      Alert.alert('로그인을 완료하지 못했어요', '다시 시도해 주세요. 앱으로 돌아오지 않는다면 Supabase Redirect URLs에 com.healthnote.app://auth/callback이 등록되어 있는지 확인해 주세요.');
+    } finally {
+      authenticating.current = false;
+      setAuthLoading(false);
+    }
+  }
 
   function retry() {
     nativeCanGoBack.current = false;
@@ -91,16 +126,21 @@ export default function App() {
               }}
               onShouldStartLoadWithRequest={({ url }) => {
                 if (url === 'about:blank') return true;
+                if (createGoogleAuthRequest(url, supabaseUrl, webUrl)) {
+                  void signInWithGoogle(url);
+                  return false;
+                }
                 try {
                   if (new URL(url).origin === webUrl.origin) return true;
                 } catch { /* 잘못된 주소도 WebView 밖으로 보내지 않는다. */ }
-                Alert.alert('외부 페이지 이동 안내', 'Google 로그인은 시스템 인증 브라우저와 WebView 세션 연결 작업이 필요해요. 현재 앱에서는 외부 인증 페이지로 이동하지 않습니다.');
+                Alert.alert('외부 페이지 이동 안내', '허용되지 않은 외부 주소입니다. 로그인 요청이라면 앱의 Supabase 주소 설정을 확인해 주세요.');
+                webView.current?.reload();
                 return false;
               }}
-              onOpenWindow={() => Alert.alert('외부 페이지 이동 안내', '새 창은 지원하지 않습니다. Google 로그인 연동은 후속 작업이 필요해요.')}
+              onOpenWindow={() => Alert.alert('외부 페이지 이동 안내', '새 창은 지원하지 않습니다.')}
               onLoadStart={({ nativeEvent }) => {
                 loadingUrl.current = nativeEvent.url;
-                setLoading(true);
+                setLoading(nativeEvent.loading);
               }}
               onLoadEnd={() => setLoading(false)}
               onError={() => setError(true)}
@@ -110,10 +150,10 @@ export default function App() {
               onContentProcessDidTerminate={retry}
               onRenderProcessGone={() => setError(true)}
             />
-            {loading && (
-              <View style={styles.loading} pointerEvents="none" accessibilityRole="progressbar">
+            {(loading || authLoading) && (
+              <View style={styles.loading} pointerEvents={authLoading ? 'auto' : 'none'} accessibilityRole="progressbar">
                 <ActivityIndicator size="large" />
-                <Text>Health Note를 불러오고 있어요.</Text>
+                <Text>{authLoading ? 'Google 로그인을 진행하고 있어요.' : 'Health Note를 불러오고 있어요.'}</Text>
               </View>
             )}
           </View>
